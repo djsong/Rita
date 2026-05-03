@@ -47,7 +47,11 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 | 4 | Cornell Box geometry + ray–triangle intersection | ✅ Done |
 | 5 | BVH acceleration structure | ✅ Done |
 | 5b | Material refactor — separate RtMaterial buffer, MaterialIndex per triangle | ✅ Done |
-| 6 | Shading — diffuse, shadow rays, path tracing | 🔧 In progress |
+| 6 | Path tracing — diffuse bounces, emissive light, PCG PRNG, multi-sample, gamma | ✅ Done |
+| 6b | Cornell Box boxes — tall & short box via AddBox() helper (rotated, 5-face quads) | ✅ Done |
+| 7 | Temporal accumulation — ping-pong float accumulation texture, reset on change | 🔲 Next |
+| 8 | Next event estimation — explicit shadow ray to light each bounce | 🔲 Planned |
+| 9 | Two-level BVH (BLAS + TLAS) — per-mesh local BVH + instance transforms | 🔲 Planned |
 
 ---
 
@@ -58,7 +62,8 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 > Sample scene is a **Cornell Box hardcoded in C++** (no asset import pipeline).  
 > Local workspace: `D:\PRGStudy\Rita`  
 > Current milestone: **Milestone 6 — Shading (diffuse, shadow rays, path tracing)**  
-> Last thing completed: Material refactor — Albedo/Emissive removed from RtTriangle; separate RtMaterial GPU buffer (t2) with MaterialIndex per triangle. 4 materials: white, red, green, light. Root signature expanded to 4 params. Image confirmed identical. Code style: Rt prefix on classes, Unreal-style PascalCase members, In prefix on parameters.
+> Last thing completed: Full Cornell Box with path tracing. Diffuse path tracing (PCG PRNG, cosine-weighted hemisphere sampling, up to 8 bounces, N samples/pixel averaged, gamma 2.0 correction). Tall and short boxes added via AddBox() helper (Y-axis rotation, 5-quad faces, no bottom). Code style: Rt prefix on classes, Unreal-style PascalCase members, In prefix on parameters.
+> Next up: Milestone 7 — Temporal accumulation. Keep a float accumulation texture across frames; blend each new frame in with weight 1/N. Requires a second UAV texture (AccumTexture) and a frame counter root constant. Reset accumulator when scene or camera changes.
 
 ---
 
