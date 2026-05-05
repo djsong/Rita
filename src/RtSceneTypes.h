@@ -22,6 +22,20 @@ struct RtMaterial
 };
 static_assert(sizeof(RtMaterial) == 24, "RtMaterial size mismatch between CPU and GPU");
 
+// Quad area light — must exactly mirror RtLight in RayGen.hlsl.
+// A random point on the light is: Corner + U*EdgeU + V*EdgeV, U/V ∈ [0,1].
+// Area is precomputed on the CPU as |EdgeU × EdgeV| so the shader doesn't have to.
+struct RtLight
+{
+    float Corner[3];   // one corner of the quad
+    float EdgeU[3];    // edge vector along one side
+    float EdgeV[3];    // edge vector along the other side
+    float Normal[3];   // outward normal (pointing toward the scene)
+    float Emissive[3]; // emitted radiance
+    float Area;        // |EdgeU × EdgeV|
+};
+static_assert(sizeof(RtLight) == 64, "RtLight size mismatch between CPU and GPU");
+
 // BVH node — must exactly mirror RtBVHNode in RayGen.hlsl.
 // TriangleCount == 0 → internal node: LeftOrFirst is the left child index (right = left+1).
 // TriangleCount  > 0 → leaf node:     LeftOrFirst is the first triangle index.

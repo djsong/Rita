@@ -4,6 +4,8 @@
 #include <fstream>
 #include <vector>
 #include <cassert>
+#include <chrono>
+#include <thread>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -19,14 +21,19 @@ static std::vector<uint8_t> LoadBinaryFile(const wchar_t* InRelativePath)
 {
     wchar_t ExeDir[MAX_PATH];
     GetModuleFileNameW(nullptr, ExeDir, MAX_PATH);
-    wchar_t* LastSlash = wcsrchr(ExeDir, L'\\');
-    if (LastSlash) *(LastSlash + 1) = L'\0';
+    wchar_t* LastSlash = wcsrchr(ExeDir, TEXT('\\'));
+    if (LastSlash)
+    {
+        *(LastSlash + 1) = TEXT('\0');
+    }
 
     std::wstring FullPath = std::wstring(ExeDir) + InRelativePath;
 
     std::ifstream File(FullPath, std::ios::binary | std::ios::ate);
     if (!File.is_open())
+    {
         throw std::runtime_error("Failed to open shader file");
+    }
 
     const size_t FileSize = static_cast<size_t>(File.tellg());
     File.seekg(0);
@@ -105,7 +112,9 @@ bool RtD3DApp::CreateAppWindow()
     Wc.lpszClassName = CLASS_NAME;
 
     if (!RegisterClassExW(&Wc))
+    {
         return false;
+    }
 
     RECT Rect = { 0, 0, static_cast<LONG>(DisplayWidth), static_cast<LONG>(DisplayHeight) };
     AdjustWindowRect(&Rect, WS_OVERLAPPEDWINDOW, FALSE);
@@ -134,7 +143,9 @@ LRESULT CALLBACK RtD3DApp::WndProc(HWND InHwnd, UINT InMsg, WPARAM InWParam, LPA
     {
     case WM_KEYDOWN:
         if (InWParam == VK_ESCAPE)
+        {
             PostQuitMessage(0);
+        }
         return 0;
 
     case WM_DESTROY:
@@ -155,7 +166,9 @@ bool RtD3DApp::InitD3D()
     {
         ComPtr<ID3D12Debug> DebugController;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&DebugController))))
+        {
             DebugController->EnableDebugLayer();
+        }
     }
 #endif
 
@@ -172,15 +185,26 @@ bool RtD3DApp::InitD3D()
     {
         DXGI_ADAPTER_DESC1 Desc;
         Adapter->GetDesc1(&Desc);
-        if (Desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        if (Desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+        {
+            continue;
+        }
         if (SUCCEEDED(D3D12CreateDevice(Adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&D3DDevice))))
+        {
             break;
+        }
     }
 
-    if (!D3DDevice) return false;
+    if (!D3DDevice)
+    {
+        return false;
+    }
     D3DDevice->SetName(L"Rita::Device");
 
-    if (!GfxCommands.Initialize(D3DDevice.Get())) return false;
+    if (!GfxCommands.Initialize(D3DDevice.Get()))
+    {
+        return false;
+    }
 
     {
         DXGI_SWAP_CHAIN_DESC1 ScDesc = {};
@@ -238,16 +262,17 @@ bool RtD3DApp::InitCompute()
     const std::vector<uint8_t> ShaderBytecode = LoadBinaryFile(L"shaders\\RayGen.cso");
 
     // --- Root signature ---
-    // [0] Descriptor table: 1 UAV at u0 (compute output texture)
+    // [0] Descriptor table: 2 UAVs — u0 OutputTexture, u1 AccumTexture
     // [1] Root SRV at t0 (triangle structured buffer)
     // [2] Root SRV at t1 (BVH node structured buffer)
     // [3] Root SRV at t2 (material structured buffer)
+    // [4] Root constants at b0 — FrameIndex (1 × 32-bit)
     D3D12_DESCRIPTOR_RANGE UavRange = {};
     UavRange.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    UavRange.NumDescriptors     = 1;
+    UavRange.NumDescriptors     = 2; // u0 + u1
     UavRange.BaseShaderRegister = 0;
 
-    D3D12_ROOT_PARAMETER RootParams[4] = {};
+    D3D12_ROOT_PARAMETER RootParams[6] = {};
 
     RootParams[0].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     RootParams[0].DescriptorTable.NumDescriptorRanges = 1;
@@ -266,8 +291,18 @@ bool RtD3DApp::InitCompute()
     RootParams[3].Descriptor.ShaderRegister = 2; // t2 — materials
     RootParams[3].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
+    RootParams[4].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    RootParams[4].Constants.ShaderRegister = 0; // b0 — FrameIndex, LightCount
+    RootParams[4].Constants.RegisterSpace  = 0;
+    RootParams[4].Constants.Num32BitValues = 2;
+    RootParams[4].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+
+    RootParams[5].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    RootParams[5].Descriptor.ShaderRegister = 3; // t3 — lights
+    RootParams[5].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_ROOT_SIGNATURE_DESC RootSigDesc = {};
-    RootSigDesc.NumParameters = 4;
+    RootSigDesc.NumParameters = 6;
     RootSigDesc.pParameters   = RootParams;
 
     ComPtr<ID3DBlob> SerializedRootSig, ErrorBlob;
@@ -282,17 +317,20 @@ bool RtD3DApp::InitCompute()
     THROW_IF_FAILED(D3DDevice->CreateComputePipelineState(&PsoDesc, IID_PPV_ARGS(&ComputePipelineState)));
     ComputePipelineState->SetName(L"Rita::ComputePSO");
 
-    // --- UAV descriptor heap (output texture) ---
+    // --- UAV descriptor heap — 2 slots: u0 OutputTexture, u1 AccumTexture ---
     {
         D3D12_DESCRIPTOR_HEAP_DESC HeapDesc = {};
         HeapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        HeapDesc.NumDescriptors = 1;
+        HeapDesc.NumDescriptors = 2;
         HeapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         THROW_IF_FAILED(D3DDevice->CreateDescriptorHeap(&HeapDesc, IID_PPV_ARGS(&UavDescriptorHeap)));
         UavDescriptorHeap->SetName(L"Rita::UAVHeap");
     }
 
-    // --- Compute output texture ---
+    const uint32_t UavDescriptorSize =
+        D3DDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // --- Compute output texture (u0) — display-format, blitted to back buffer ---
     {
         D3D12_HEAP_PROPERTIES HeapProps = {};
         HeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -312,10 +350,7 @@ bool RtD3DApp::InitCompute()
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
             IID_PPV_ARGS(&ComputeOutputTexture)));
         ComputeOutputTexture->SetName(L"Rita::ComputeOutputTexture");
-    }
 
-    // --- UAV descriptor ---
-    {
         D3D12_UNORDERED_ACCESS_VIEW_DESC UavDesc = {};
         UavDesc.Format             = DXGI_FORMAT_R8G8B8A8_UNORM;
         UavDesc.ViewDimension      = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -323,6 +358,39 @@ bool RtD3DApp::InitCompute()
         D3DDevice->CreateUnorderedAccessView(
             ComputeOutputTexture.Get(), nullptr, &UavDesc,
             UavDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    // --- Accumulation texture (u1) — full float precision for the running average ---
+    {
+        D3D12_HEAP_PROPERTIES HeapProps = {};
+        HeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC TexDesc = {};
+        TexDesc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        TexDesc.Width            = DisplayWidth;
+        TexDesc.Height           = DisplayHeight;
+        TexDesc.DepthOrArraySize = 1;
+        TexDesc.MipLevels        = 1;
+        TexDesc.Format           = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        TexDesc.SampleDesc.Count = 1;
+        TexDesc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        THROW_IF_FAILED(D3DDevice->CreateCommittedResource(
+            &HeapProps, D3D12_HEAP_FLAG_NONE, &TexDesc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&AccumTexture)));
+        AccumTexture->SetName(L"Rita::AccumTexture");
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC UavDesc = {};
+        UavDesc.Format             = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        UavDesc.ViewDimension      = D3D12_UAV_DIMENSION_TEXTURE2D;
+        UavDesc.Texture2D.MipSlice = 0;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE AccumHandle =
+            UavDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+        AccumHandle.ptr += UavDescriptorSize; // slot 1
+        D3DDevice->CreateUnorderedAccessView(
+            AccumTexture.Get(), nullptr, &UavDesc, AccumHandle);
     }
 
     return true;
@@ -345,17 +413,37 @@ void RtD3DApp::Shutdown()
 
 int RtD3DApp::Run()
 {
+    using Clock    = std::chrono::high_resolution_clock;
+    using Duration = std::chrono::duration<double>;
+
     MSG Msg = {};
     while (true)
     {
+        const auto FrameStart = Clock::now();
+
         while (PeekMessageW(&Msg, nullptr, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&Msg);
             DispatchMessageW(&Msg);
             if (Msg.message == WM_QUIT)
+            {
                 return static_cast<int>(Msg.wParam);
+            }
         }
+
         Render();
+
+        // Sleep off any remaining frame budget (skip if TargetMaxFps == 0)
+        if (TargetMaxFps > 0)
+        {
+            const Duration TargetFrameTime(1.0 / TargetMaxFps);
+            const Duration Elapsed = Clock::now() - FrameStart;
+            const Duration SleepTime = TargetFrameTime - Elapsed;
+            if (SleepTime > Duration(0))
+            {
+                std::this_thread::sleep_for(SleepTime);
+            }
+        }
     }
 }
 
@@ -382,9 +470,18 @@ void RtD3DApp::DispatchCompute(ID3D12GraphicsCommandList* InCmd)
     // [3] Material buffer
     InCmd->SetComputeRootShaderResourceView(3, SampleScene.GetMaterialBufferGPUAddress());
 
+    // [4] Root constants: FrameIndex + LightCount
+    const uint32_t RootConsts[2] = { FrameAccumCount, SampleScene.GetLightCount() };
+    InCmd->SetComputeRoot32BitConstants(4, 2, RootConsts, 0);
+
+    // [5] Light buffer
+    InCmd->SetComputeRootShaderResourceView(5, SampleScene.GetLightBufferGPUAddress());
+
     const uint32_t GroupsX = (DisplayWidth  + 7) / 8;
     const uint32_t GroupsY = (DisplayHeight + 7) / 8;
     InCmd->Dispatch(GroupsX, GroupsY, 1);
+
+    ++FrameAccumCount;
 }
 
 // ---------------------------------------------------------------------------

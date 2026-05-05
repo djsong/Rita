@@ -60,9 +60,14 @@ private:
     ComPtr<ID3D12RootSignature>  ComputeRootSignature;
     ComPtr<ID3D12PipelineState>  ComputePipelineState;
     ComPtr<ID3D12Resource>       ComputeOutputTexture;
+    ComPtr<ID3D12Resource>       AccumTexture;        // full-precision running average (u1)
     ComPtr<ID3D12DescriptorHeap> UavDescriptorHeap;
+
+    uint32_t                     FrameAccumCount = 0; // total frames accumulated so far
 
     // Per-frame rendering
     void Render();
     D3D12_CPU_DESCRIPTOR_HANDLE GetCurrentRTV() const;
+
+    uint32_t TargetMaxFps = 120; // frame rate cap; set to 0 to disable
 };

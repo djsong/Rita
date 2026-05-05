@@ -22,10 +22,29 @@ struct RtMaterial
     float3 Emissive;
 };
 
-RWTexture2D<float4>          OutputTexture  : register(u0);
+// Must mirror RtLight in RtSceneTypes.h
+struct RtLight
+{
+    float3 Corner;   // one corner of the quad
+    float3 EdgeU;    // edge vector along one side
+    float3 EdgeV;    // edge vector along the other side
+    float3 Normal;   // outward normal (pointing toward the scene)
+    float3 Emissive; // emitted radiance
+    float  Area;     // |EdgeU × EdgeV|, precomputed on CPU
+};
+
+RWTexture2D<float4>          OutputTexture  : register(u0); // display output (gamma corrected)
+RWTexture2D<float4>          AccumTexture   : register(u1); // full-float running average
 StructuredBuffer<RtTriangle> SceneTriangles : register(t0);
 StructuredBuffer<RtBVHNode>  BVHNodes       : register(t1);
 StructuredBuffer<RtMaterial> Materials      : register(t2);
+StructuredBuffer<RtLight>    Lights         : register(t3);
+
+cbuffer RootConstants : register(b0)
+{
+    uint FrameIndex;  // total frames accumulated — used to weight the running average
+    uint LightCount;  // number of entries in the Lights buffer
+}
 
 // ---------------------------------------------------------------------------
 // Camera
@@ -33,12 +52,21 @@ StructuredBuffer<RtMaterial> Materials      : register(t2);
 static const float3 CameraPos   = float3(0.0f, 0.0f, -3.0f);
 static const float  VerticalFov = 60.0f;
 
+// (Light geometry and emissive values are now in the Lights structured buffer — see RtLight above.)
+
+// ---------------------------------------------------------------------------
+// Feature switches — recompile to toggle
+// ---------------------------------------------------------------------------
+// 0 = pure unidirectional path tracing (current baseline)
+// 1 = next event estimation: explicit shadow ray to the light at every bounce
+#define RITA_RAYGEN_NEE 1
+
 // ---------------------------------------------------------------------------
 // Path tracing constants
 // ---------------------------------------------------------------------------
 static const float PI         = 3.14159265f;
 static const int   MaxBounces = 8;
-static const int   NumSamples = 64; // Cleaner result with more sample, but you cannot put that much.
+static const int   NumSamples = 1;  // 1 sample/frame — temporal accumulation does the averaging
 static const float RayEpsilon = 1e-4f;
 
 // ---------------------------------------------------------------------------
@@ -186,6 +214,69 @@ bool TraceRay(float3 InRayOrigin, float3 InRayDir,
 }
 
 // ---------------------------------------------------------------------------
+// Returns a uniformly random point on a quad light.
+// Parametric form: Corner + U*EdgeU + V*EdgeV, U/V ∈ [0, 1].
+// ---------------------------------------------------------------------------
+float3 SampleLightPoint(RtLight InLight, inout uint InOutRng)
+{
+    return InLight.Corner
+         + RandFloat(InOutRng) * InLight.EdgeU
+         + RandFloat(InOutRng) * InLight.EdgeV;
+}
+
+// ---------------------------------------------------------------------------
+// Shadow ray — returns true if any opaque geometry occludes the path before
+// InMaxT.  Emissive (light) triangles are skipped: they are the target of
+// the shadow ray, not potential occluders.
+// ---------------------------------------------------------------------------
+bool TraceShadow(float3 InRayOrigin, float3 InRayDir, float InMaxT)
+{
+    float3 InvRayDir = 1.0f / InRayDir;
+
+    int Stack[32];
+    int StackTop = 0;
+    Stack[StackTop++] = 0;
+
+    while (StackTop > 0)
+    {
+        int       NodeIdx = Stack[--StackTop];
+        RtBVHNode Node    = BVHNodes[NodeIdx];
+
+        if (!RayAABBIntersect(InRayOrigin, InvRayDir, Node.BoundsMin, Node.BoundsMax, InMaxT))
+        {
+            continue;
+        }
+
+        if (Node.TriangleCount > 0)
+        {
+            for (uint i = Node.LeftOrFirst; i < Node.LeftOrFirst + Node.TriangleCount; ++i)
+            {
+                // Skip light triangles — they are the shadow ray target, not occluders
+                if (any(Materials[SceneTriangles[i].MaterialIndex].Emissive > 0.0f))
+                {
+                    continue;
+                }
+
+                float T = 0.0f;
+                if (RayTriangleIntersect(InRayOrigin, InRayDir,
+                        SceneTriangles[i].V0, SceneTriangles[i].V1, SceneTriangles[i].V2, T)
+                    && T < InMaxT)
+                {
+                    return true; // occluded
+                }
+            }
+        }
+        else
+        {
+            Stack[StackTop++] = (int)Node.LeftOrFirst;
+            Stack[StackTop++] = (int)Node.LeftOrFirst + 1;
+        }
+    }
+
+    return false; // unoccluded — light is visible
+}
+
+// ---------------------------------------------------------------------------
 // Path trace a single ray — returns the radiance arriving along InRayDir.
 // Follows the path for up to MaxBounces diffuse bounces.
 // ---------------------------------------------------------------------------
@@ -208,17 +299,67 @@ float3 PathTrace(float3 InRayOrigin, float3 InRayDir, inout uint InOutRng)
             break;
         }
 
-        RtTriangle Tri = SceneTriangles[TriIndex];
-        RtMaterial Mat = Materials[Tri.MaterialIndex];
+        RtTriangle Tri     = SceneTriangles[TriIndex];
+        RtMaterial Mat     = Materials[Tri.MaterialIndex];
+        float3     HitPoint = RayOrigin + T * RayDir;
 
-        // Add emitted light at this surface
-        Radiance += Throughput * Mat.Emissive;
+#if RITA_RAYGEN_NEE
+        // --- Next event estimation ---
+        // Camera rays that hit the light directly still show it as bright.
+        // Indirect bounces skip the emissive term because the shadow ray
+        // below already accounts for direct illumination — adding it again
+        // would double-count and overbrighten the scene.
+        if (Bounce == 0)
+        {
+            Radiance += Throughput * Mat.Emissive;
+        }
 
-        // Emissive surfaces do not scatter — terminate the path
+        // Light surfaces do not scatter
         if (any(Mat.Emissive > 0.0f))
         {
             break;
         }
+
+        // --- Direct illumination: explicit shadow ray to a random light ---
+        {
+            // Pick one light uniformly at random; the LightCount factor in the
+            // estimator compensates for the 1/LightCount probability of choosing it.
+            uint   LightIdx = min(uint(RandFloat(InOutRng) * float(LightCount)), LightCount - 1);
+            RtLight Light   = Lights[LightIdx];
+
+            float3 ShadowOrigin = HitPoint + Tri.Normal * RayEpsilon;
+            float3 LightPoint   = SampleLightPoint(Light, InOutRng);
+            float3 ToLight      = LightPoint - ShadowOrigin;
+            float  LightDist    = length(ToLight);
+            float3 LightDir     = ToLight / LightDist;
+
+            float CosAtSurface = dot(Tri.Normal,    LightDir);
+            float CosAtLight   = dot(Light.Normal, -LightDir);
+
+            if (CosAtSurface > 0.0f && CosAtLight > 0.0f)
+            {
+                if (!TraceShadow(ShadowOrigin, LightDir, LightDist))
+                {
+                    // Estimator: (albedo/PI) * L_e * cos_surface * cos_light * A / r²
+                    // Multiplied by LightCount: PDF of choosing this light was 1/LightCount.
+                    // The 1/PI from the Lambertian BRDF stays because we sample in area
+                    // measure (unlike the indirect bounce where it cancels with the PDF).
+                    float GeometryFactor = CosAtSurface * CosAtLight / (LightDist * LightDist);
+                    Radiance += Throughput * Mat.Albedo * Light.Emissive
+                              * GeometryFactor * Light.Area * float(LightCount) / PI;
+                }
+            }
+        }
+
+#else
+        // --- Pure path tracing (baseline) ---
+        // Add emitted light at this surface and terminate if it was a light
+        Radiance += Throughput * Mat.Emissive;
+        if (any(Mat.Emissive > 0.0f))
+        {
+            break;
+        }
+#endif
 
         // Diffuse scatter: multiply throughput by albedo.
         // The cos(theta)/PI from the BRDF and the PI/cos(theta) from the PDF cancel
@@ -232,7 +373,6 @@ float3 PathTrace(float3 InRayOrigin, float3 InRayDir, inout uint InOutRng)
         }
 
         // Spawn the next ray from the hit point, nudged along the normal
-        float3 HitPoint = RayOrigin + T * RayDir;
         RayOrigin = HitPoint + Tri.Normal * RayEpsilon;
         RayDir    = CosineHemisphere(Tri.Normal, InOutRng);
     }
@@ -265,23 +405,20 @@ void CSMain(uint3 DispatchThreadID : SV_DispatchThreadID)
         NDC.y * TanHalfFov,
         1.0f));
 
-    // Per-pixel RNG seed, unique across the screen
-    uint RngState = (DispatchThreadID.x * 1973u + DispatchThreadID.y * 9277u) | 1u;
+    // Per-pixel RNG seed — include FrameIndex so every frame explores different directions
+    uint RngState = PCGHash(DispatchThreadID.x * 1973u + DispatchThreadID.y * 9277u + FrameIndex * 26699u);
 
-    // Accumulate NumSamples independent paths and average
-    float3 AccumulatedColor = float3(0, 0, 0);
-    for (int Sample = 0; Sample < NumSamples; ++Sample)
-    {
-        // Advance seed so each sample gets a fresh, uncorrelated sequence
-        RngState = PCGHash(RngState + uint(Sample) * 26699u);
-        AccumulatedColor += PathTrace(CameraPos, PrimaryDir, RngState);
-    }
+    // Trace one new sample this frame
+    float3 NewSample = PathTrace(CameraPos, PrimaryDir, RngState);
 
-    float3 Color = AccumulatedColor / float(NumSamples);
+    // Blend into the running average:
+    //   AccumColor = (AccumColor * FrameIndex + NewSample) / (FrameIndex + 1)
+    // On the very first frame (FrameIndex == 0) this reduces to just NewSample.
+    float3 PrevAccum  = AccumTexture[DispatchThreadID.xy].rgb;
+    float3 NewAccum   = (PrevAccum * float(FrameIndex) + NewSample) / float(FrameIndex + 1);
+    AccumTexture[DispatchThreadID.xy] = float4(NewAccum, 1.0f);
 
-    // Gamma correction: convert linear light values to display-space
-    // (gamma 2.0 approximation — sqrt is close enough for a study renderer)
-    Color = sqrt(max(Color, 0.0f));
-
-    OutputTexture[DispatchThreadID.xy] = float4(Color, 1.0f);
+    // Gamma-correct the accumulated linear value for display
+    float3 DisplayColor = sqrt(max(NewAccum, 0.0f));
+    OutputTexture[DispatchThreadID.xy] = float4(DisplayColor, 1.0f);
 }

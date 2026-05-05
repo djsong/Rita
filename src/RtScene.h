@@ -21,11 +21,18 @@ public:
     D3D12_GPU_VIRTUAL_ADDRESS GetTriangleBufferGPUAddress() const;
     D3D12_GPU_VIRTUAL_ADDRESS GetBVHNodeBufferGPUAddress()  const;
     D3D12_GPU_VIRTUAL_ADDRESS GetMaterialBufferGPUAddress() const;
+    D3D12_GPU_VIRTUAL_ADDRESS GetLightBufferGPUAddress()    const;
+    uint32_t                  GetLightCount()               const;
 
 private:
     // --- Scene build ---
     void     BuildCornellBox();
     uint32_t AddMaterial(const float* InAlbedo, const float* InEmissive);
+    // Registers a quad as both visible geometry and a samplable area light.
+    // Combines AddQuad + light buffer registration so callers only make one call.
+    void     AddLight(const float* InV0, const float* InV1,
+                      const float* InV2, const float* InV3,
+                      const float* InNormal, const float* InEmissive);
     void     AddQuad(
                  const float* InV0, const float* InV1,
                  const float* InV2, const float* InV3,
@@ -49,6 +56,7 @@ private:
     std::vector<RtTriangle> Triangles;
     std::vector<RtMaterial> Materials;
     std::vector<RtBVHNode>  BVHNodes;
+    std::vector<RtLight>    Lights;
     uint32_t                BVHNextFreeNode = 0;
 
     // --- GPU buffers ---
@@ -60,6 +68,9 @@ private:
 
     ComPtr<ID3D12Resource>  MaterialBuffer;
     ComPtr<ID3D12Resource>  MaterialUploadBuffer;
+
+    ComPtr<ID3D12Resource>  LightBuffer;
+    ComPtr<ID3D12Resource>  LightUploadBuffer;
 
     // --- Helper: create default+upload buffer pair and record the copy ---
     void UploadBuffer(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCmd,

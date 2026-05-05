@@ -31,7 +31,6 @@ void RtSampleScene::BuildCornellBox()
     const uint32_t MatWhite = AddMaterial(WHITE, NO_EMIT);
     const uint32_t MatRed   = AddMaterial(RED,   NO_EMIT);
     const uint32_t MatGreen = AddMaterial(GREEN, NO_EMIT);
-    const uint32_t MatLight = AddMaterial(WHITE, LIGHT);
 
     // Back wall — white, z=2, normal (0,0,-1)
     {
@@ -68,12 +67,13 @@ void RtSampleScene::BuildCornellBox()
         AddQuad(V0, V1, V2, V3, N, MatGreen);
     }
 
-    // Ceiling light — emissive, slightly below y=1 so it doesn't z-fight the ceiling
+    // Ceiling light — emissive quad, slightly below y=1 so it doesn't z-fight the ceiling.
+    // AddLight registers both the visible geometry and the samplable area light entry.
     {
         const float N[]  = { 0, -1, 0 };
         const float V0[] = { -0.3f, 0.99f, 0.8f }, V1[] = {  0.3f, 0.99f, 0.8f },
                     V2[] = {  0.3f, 0.99f, 1.2f }, V3[] = { -0.3f, 0.99f, 1.2f };
-        AddQuad(V0, V1, V2, V3, N, MatLight);
+        AddLight(V0, V1, V2, V3, N, LIGHT);
     }
 
     // Tall box — right-back area, 15° CW rotation, reaches ~60% of room height
@@ -81,6 +81,38 @@ void RtSampleScene::BuildCornellBox()
 
     // Short box — left-front area, 15° CCW rotation, reaches ~30% of room height
     AddBox(-0.32f, 1.0f,  0.30f, 0.30f,  0.6f, -15.0f, MatWhite);
+}
+
+void RtSampleScene::AddLight(
+    const float* InV0, const float* InV1,
+    const float* InV2, const float* InV3,
+    const float* InNormal, const float* InEmissive)
+{
+    // Register as visible geometry so camera rays can see the light panel
+    const uint32_t MatIdx = AddMaterial(WHITE, InEmissive);
+    AddQuad(InV0, InV1, InV2, InV3, InNormal, MatIdx);
+
+    // Derive edge vectors from the quad vertices: EdgeU = V1-V0, EdgeV = V3-V0
+    const float EdgeU[3] = { InV1[0]-InV0[0], InV1[1]-InV0[1], InV1[2]-InV0[2] };
+    const float EdgeV[3] = { InV3[0]-InV0[0], InV3[1]-InV0[1], InV3[2]-InV0[2] };
+
+    // Area = |EdgeU × EdgeV|
+    const float Cross[3] =
+    {
+        EdgeU[1]*EdgeV[2] - EdgeU[2]*EdgeV[1],
+        EdgeU[2]*EdgeV[0] - EdgeU[0]*EdgeV[2],
+        EdgeU[0]*EdgeV[1] - EdgeU[1]*EdgeV[0]
+    };
+
+    RtLight Light = {};
+    memcpy(Light.Corner,   InV0,       12);
+    memcpy(Light.EdgeU,    EdgeU,      12);
+    memcpy(Light.EdgeV,    EdgeV,      12);
+    memcpy(Light.Normal,   InNormal,   12);
+    memcpy(Light.Emissive, InEmissive, 12);
+    Light.Area = sqrtf(Cross[0]*Cross[0] + Cross[1]*Cross[1] + Cross[2]*Cross[2]);
+
+    Lights.push_back(Light);
 }
 
 uint32_t RtSampleScene::AddMaterial(const float* InAlbedo, const float* InEmissive)
@@ -316,20 +348,26 @@ bool RtSampleScene::Initialize(ID3D12Device* InDevice, ID3D12GraphicsCommandList
     UploadBuffer(InDevice, InCmd,
         Triangles.data(),
         static_cast<uint32_t>(Triangles.size() * sizeof(RtTriangle)),
-        L"Rita::TriangleBuffer",
+        TEXT("Rita::TriangleBuffer"),
         TriangleBuffer, TriangleUploadBuffer);
 
     UploadBuffer(InDevice, InCmd,
         BVHNodes.data(),
         static_cast<uint32_t>(BVHNodes.size() * sizeof(RtBVHNode)),
-        L"Rita::BVHNodeBuffer",
+        TEXT("Rita::BVHNodeBuffer"),
         BVHNodeBuffer, BVHNodeUploadBuffer);
 
     UploadBuffer(InDevice, InCmd,
         Materials.data(),
         static_cast<uint32_t>(Materials.size() * sizeof(RtMaterial)),
-        L"Rita::MaterialBuffer",
+        TEXT("Rita::MaterialBuffer"),
         MaterialBuffer, MaterialUploadBuffer);
+
+    UploadBuffer(InDevice, InCmd,
+        Lights.data(),
+        static_cast<uint32_t>(Lights.size() * sizeof(RtLight)),
+        TEXT("Rita::LightBuffer"),
+        LightBuffer, LightUploadBuffer);
 
     return true;
 }
@@ -346,9 +384,12 @@ void RtSampleScene::Shutdown()
     BVHNodeUploadBuffer.Reset();
     MaterialBuffer.Reset();
     MaterialUploadBuffer.Reset();
+    LightBuffer.Reset();
+    LightUploadBuffer.Reset();
     Triangles.clear();
     BVHNodes.clear();
     Materials.clear();
+    Lights.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -368,4 +409,14 @@ D3D12_GPU_VIRTUAL_ADDRESS RtSampleScene::GetBVHNodeBufferGPUAddress() const
 D3D12_GPU_VIRTUAL_ADDRESS RtSampleScene::GetMaterialBufferGPUAddress() const
 {
     return MaterialBuffer->GetGPUVirtualAddress();
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS RtSampleScene::GetLightBufferGPUAddress() const
+{
+    return LightBuffer->GetGPUVirtualAddress();
+}
+
+uint32_t RtSampleScene::GetLightCount() const
+{
+    return static_cast<uint32_t>(Lights.size());
 }

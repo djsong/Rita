@@ -49,8 +49,12 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 | 5b | Material refactor — separate RtMaterial buffer, MaterialIndex per triangle | ✅ Done |
 | 6 | Path tracing — diffuse bounces, emissive light, PCG PRNG, multi-sample, gamma | ✅ Done |
 | 6b | Cornell Box boxes — tall & short box via AddBox() helper (rotated, 5-face quads) | ✅ Done |
-| 7 | Temporal accumulation — ping-pong float accumulation texture, reset on change | 🔲 Next |
-| 8 | Next event estimation — explicit shadow ray to light each bounce | 🔲 Planned |
+| 7 | Temporal accumulation — AccumTexture (R32G32B32A32), FrameIndex root constant, running average blend | ✅ Done |
+| 7b | Frame rate cap — TargetMaxFps member, sleep_for remaining budget in Run() | ✅ Done |
+| 7c | Brace convention — all if/for/while bodies braced throughout codebase | ✅ Done |
+| 8 | Next event estimation — TraceShadow() + SampleLightPoint(), direct contribution at every bounce | ✅ Done |
+| 8b | RtLight GPU buffer — light data moved from shader constants to StructuredBuffer<RtLight>, injected from RtSampleScene | ✅ Done |
+| 8c | AddLight refactor — single AddLight(V0,V1,V2,V3,Normal,Emissive) call registers both geometry and light buffer entry; MatLight and duplicate AddQuad removed from BuildCornellBox | ✅ Done |
 | 9 | Two-level BVH (BLAS + TLAS) — per-mesh local BVH + instance transforms | 🔲 Planned |
 
 ---
@@ -61,9 +65,9 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 > No RTX APIs — must run on non-RTX hardware. Windows only, HLSL.  
 > Sample scene is a **Cornell Box hardcoded in C++** (no asset import pipeline).  
 > Local workspace: `D:\PRGStudy\Rita`  
-> Current milestone: **Milestone 6 — Shading (diffuse, shadow rays, path tracing)**  
-> Last thing completed: Full Cornell Box with path tracing. Diffuse path tracing (PCG PRNG, cosine-weighted hemisphere sampling, up to 8 bounces, N samples/pixel averaged, gamma 2.0 correction). Tall and short boxes added via AddBox() helper (Y-axis rotation, 5-quad faces, no bottom). Code style: Rt prefix on classes, Unreal-style PascalCase members, In prefix on parameters.
-> Next up: Milestone 7 — Temporal accumulation. Keep a float accumulation texture across frames; blend each new frame in with weight 1/N. Requires a second UAV texture (AccumTexture) and a frame counter root constant. Reset accumulator when scene or camera changes.
+> Current milestone: **Milestone 8c complete — AddLight refactor**  
+> Last thing completed: Light data fully refactored. RtLight GPU buffer (StructuredBuffer<RtLight> at t3) carries Corner/EdgeU/EdgeV/Normal/Emissive/Area per light, injected from RtSampleScene. AddLight(V0,V1,V2,V3,Normal,Emissive) now registers both visible geometry (via internal AddQuad) and the area light entry in one call — the separate MatLight material and duplicate AddQuad in BuildCornellBox have been removed. NEE toggle: #define RITA_RAYGEN_NEE 0/1. Code style: Rt prefix on classes, Unreal-style PascalCase members, In prefix on parameters, braces on all control flow bodies.  
+> Next up: Milestone 9 — Two-level BVH (BLAS + TLAS). Per-mesh BVH built in local space (BLAS), top-level BVH over instances with 4×4 transforms (TLAS). Shader traversal becomes two-phase: test TLAS AABBs, transform ray into instance local space, traverse BLAS.
 
 ---
 
