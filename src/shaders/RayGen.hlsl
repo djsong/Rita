@@ -33,6 +33,30 @@ struct RtLight
     float  Area;     // |EdgeU × EdgeV|, precomputed on CPU
 };
 
+// Must mirror RtTLASNode in RtSceneTypes.h
+// Identical layout to RtBVHNode; leaves index into the instance list instead of triangles.
+struct RtTLASNode
+{
+    float3 BoundsMin;
+    uint   LeftOrFirst;    // internal: left child (right = left+1); leaf: first instance index
+    float3 BoundsMax;
+    uint   InstanceCount;  // 0 = internal, >0 = leaf
+};
+
+// Must mirror RtInstance in RtSceneTypes.h
+// Transforms are 3×4 row-major, column-vector convention:
+//   world_pos = mul(Transform,    float4(local_pos, 1))
+//   local_pos = mul(InvTransform, float4(world_pos, 1))
+// Assumption: rotation + translation only (no scale) — T and normal direction are preserved.
+// row_major ensures the HLSL byte layout matches the CPU float[12] row-major storage.
+struct RtInstance
+{
+    row_major float3x4 Transform;    // local→world: upper 3×3 rotates normals to world space
+    row_major float3x4 InvTransform; // world→local: transforms rays into local space for BLAS traversal
+    uint               BLASRootNode;   // root node index in the shared BVH node buffer
+    uint               TriangleOffset; // first triangle index in the shared triangle buffer
+};
+
 // ---------------------------------------------------------------------------
 // Resource bindings
 // ---------------------------------------------------------------------------
@@ -42,11 +66,14 @@ StructuredBuffer<RtTriangle> SceneTriangles : register(t0);
 StructuredBuffer<RtBVHNode>  BVHNodes       : register(t1);
 StructuredBuffer<RtMaterial> Materials      : register(t2);
 StructuredBuffer<RtLight>    Lights         : register(t3);
+StructuredBuffer<RtInstance> Instances      : register(t4);
+StructuredBuffer<RtTLASNode> TLASNodes      : register(t5);
 
 cbuffer RootConstants : register(b0)
 {
-    uint FrameIndex;  // total frames accumulated — used to weight the running average
-    uint LightCount;  // number of entries in the Lights buffer
+    uint FrameIndex;    // total frames accumulated — used to weight the running average
+    uint LightCount;    // number of entries in the Lights buffer
+    uint InstanceCount; // number of entries in the Instances buffer
 }
 
 // ---------------------------------------------------------------------------
@@ -168,97 +195,176 @@ bool RayAABBIntersect(float3 InRayOrigin, float3 InvRayDir,
     return TExit >= max(TEnter, 0.0f) && TEnter < InTMax;
 }
 
-// BVH traversal — finds the nearest triangle hit along the ray.
-// Returns true if any triangle was hit; OutT and OutTriIndex are set on hit.
+// Two-level BVH traversal — walks the TLAS to find candidate instances, then dives
+// into each instance's BLAS to find the nearest triangle hit.
+// The ray is transformed into each instance's local space before BLAS traversal,
+// so all triangles and BVH nodes can be stored in local coordinates.
+// T is invariant between local and world space for rotation+translation transforms (no scale).
 bool TraceRay(float3 InRayOrigin, float3 InRayDir,
-              out float OutT, out int OutTriIndex)
+              out float OutT, out int OutTriIndex, out int OutInstIndex)
 {
     float3 InvRayDir = 1.0f / InRayDir;
-    OutT        = 1e30f;
-    OutTriIndex = -1;
+    OutT         = 1e30f;
+    OutTriIndex  = -1;
+    OutInstIndex = -1;
 
-    int Stack[32];
-    int StackTop = 0;
-    Stack[StackTop++] = 0; // root node
+    int TLASStack[32]; // manual traversal stack — 32 levels covers scenes with millions of instances
+    int TLASTop = 0;
+    TLASStack[TLASTop++] = 0; // TLAS root
 
-    while (StackTop > 0)
+    int BLASStack[32]; // re-used per instance; reset to 0 at the start of each BLAS walk
+
+    while (TLASTop > 0)
     {
-        int       NodeIdx = Stack[--StackTop];
-        RtBVHNode Node    = BVHNodes[NodeIdx];
+        int        TLASIdx  = TLASStack[--TLASTop];
+        RtTLASNode TLASNode = TLASNodes[TLASIdx];
 
-        if (!RayAABBIntersect(InRayOrigin, InvRayDir, Node.BoundsMin, Node.BoundsMax, OutT))
+        // Test world-space ray against world-space TLAS node AABB
+        if (!RayAABBIntersect(InRayOrigin, InvRayDir, TLASNode.BoundsMin, TLASNode.BoundsMax, OutT))
         {
             continue;
         }
 
-        if (Node.TriangleCount > 0) // leaf — test each triangle
+        if (TLASNode.InstanceCount > 0) // TLAS leaf — traverse each instance's BLAS
         {
-            for (uint i = Node.LeftOrFirst; i < Node.LeftOrFirst + Node.TriangleCount; ++i)
+            for (uint i = TLASNode.LeftOrFirst; i < TLASNode.LeftOrFirst + TLASNode.InstanceCount; ++i)
             {
-                float T = 0.0f;
-                if (RayTriangleIntersect(InRayOrigin, InRayDir,
-                        SceneTriangles[i].V0, SceneTriangles[i].V1, SceneTriangles[i].V2, T)
-                    && T < OutT)
+                RtInstance Inst = Instances[i];
+
+                // Transform ray into this instance's local space.
+                // BLAS nodes and triangles are stored in local coordinates.
+                // mul(InvTransform, float4(p,1)) applies the full affine inverse (R^T * (p - t)).
+                // mul((float3x3)InvTransform, d) applies only the rotation part (R^T * d).
+                // T values are preserved because rotation doesn't change ray direction length.
+                float3 LocalOrigin = mul(Inst.InvTransform, float4(InRayOrigin, 1.0f));
+                float3 LocalDir    = mul((float3x3)Inst.InvTransform, InRayDir);
+                float3 LocalInvDir = 1.0f / LocalDir;
+
+                int BLASTop = 0;
+                BLASStack[BLASTop++] = (int)Inst.BLASRootNode;
+
+                while (BLASTop > 0)
                 {
-                    OutT        = T;
-                    OutTriIndex = (int)i;
+                    int       NodeIdx = BLASStack[--BLASTop];
+                    RtBVHNode Node    = BVHNodes[NodeIdx];
+
+                    // Test local-space ray against local-space BLAS node AABB
+                    if (!RayAABBIntersect(LocalOrigin, LocalInvDir, Node.BoundsMin, Node.BoundsMax, OutT))
+                    {
+                        continue;
+                    }
+
+                    if (Node.TriangleCount > 0) // BLAS leaf — test each triangle
+                    {
+                        for (uint j = Node.LeftOrFirst; j < Node.LeftOrFirst + Node.TriangleCount; ++j)
+                        {
+                            float T = 0.0f;
+                            if (RayTriangleIntersect(LocalOrigin, LocalDir,
+                                    SceneTriangles[j].V0, SceneTriangles[j].V1, SceneTriangles[j].V2, T)
+                                && T < OutT)
+                            {
+                                OutT         = T;
+                                OutTriIndex  = (int)j;
+                                OutInstIndex = (int)i;
+                            }
+                        }
+                    }
+                    else // BLAS internal — push children
+                    {
+                        BLASStack[BLASTop++] = (int)Node.LeftOrFirst;
+                        BLASStack[BLASTop++] = (int)Node.LeftOrFirst + 1;
+                    }
                 }
             }
         }
-        else // internal — push children
+        else // TLAS internal — push children
         {
-            Stack[StackTop++] = (int)Node.LeftOrFirst;
-            Stack[StackTop++] = (int)Node.LeftOrFirst + 1;
+            TLASStack[TLASTop++] = (int)TLASNode.LeftOrFirst;
+            TLASStack[TLASTop++] = (int)TLASNode.LeftOrFirst + 1;
         }
     }
 
     return OutTriIndex >= 0;
 }
 
-// Shadow ray traversal — returns true if opaque geometry occludes the path before InMaxT.
+// Two-level shadow traversal — walks TLAS then each instance's BLAS.
+// Returns true as soon as any opaque geometry occludes the path before InMaxT.
 // Emissive (light) triangles are skipped: they are the target, not potential occluders.
-// Equivalent to a shadow TraceRay with an any-hit shader that rejects emissive surfaces.
 bool TraceShadow(float3 InRayOrigin, float3 InRayDir, float InMaxT)
 {
     float3 InvRayDir = 1.0f / InRayDir;
 
-    int Stack[32];
-    int StackTop = 0;
-    Stack[StackTop++] = 0;
+    int TLASStack[32];
+    int TLASTop = 0;
+    TLASStack[TLASTop++] = 0; // TLAS root
 
-    while (StackTop > 0)
+    int BLASStack[32];
+
+    while (TLASTop > 0)
     {
-        int       NodeIdx = Stack[--StackTop];
-        RtBVHNode Node    = BVHNodes[NodeIdx];
+        int        TLASIdx  = TLASStack[--TLASTop];
+        RtTLASNode TLASNode = TLASNodes[TLASIdx];
 
-        if (!RayAABBIntersect(InRayOrigin, InvRayDir, Node.BoundsMin, Node.BoundsMax, InMaxT))
+        if (!RayAABBIntersect(InRayOrigin, InvRayDir, TLASNode.BoundsMin, TLASNode.BoundsMax, InMaxT))
         {
             continue;
         }
 
-        if (Node.TriangleCount > 0)
+        if (TLASNode.InstanceCount > 0) // TLAS leaf — traverse each instance's BLAS
         {
-            for (uint i = Node.LeftOrFirst; i < Node.LeftOrFirst + Node.TriangleCount; ++i)
+            for (uint i = TLASNode.LeftOrFirst; i < TLASNode.LeftOrFirst + TLASNode.InstanceCount; ++i)
             {
-                // Skip light triangles — they are the shadow ray target, not occluders
-                if (any(Materials[SceneTriangles[i].MaterialIndex].Emissive > 0.0f))
-                {
-                    continue;
-                }
+                RtInstance Inst = Instances[i];
 
-                float T = 0.0f;
-                if (RayTriangleIntersect(InRayOrigin, InRayDir,
-                        SceneTriangles[i].V0, SceneTriangles[i].V1, SceneTriangles[i].V2, T)
-                    && T < InMaxT)
+                // Transform shadow ray into this instance's local space
+                float3 LocalOrigin = mul(Inst.InvTransform, float4(InRayOrigin, 1.0f));
+                float3 LocalDir    = mul((float3x3)Inst.InvTransform, InRayDir);
+                float3 LocalInvDir = 1.0f / LocalDir;
+
+                int BLASTop = 0;
+                BLASStack[BLASTop++] = (int)Inst.BLASRootNode;
+
+                while (BLASTop > 0)
                 {
-                    return true; // occluded
+                    int       NodeIdx = BLASStack[--BLASTop];
+                    RtBVHNode Node    = BVHNodes[NodeIdx];
+
+                    if (!RayAABBIntersect(LocalOrigin, LocalInvDir, Node.BoundsMin, Node.BoundsMax, InMaxT))
+                    {
+                        continue;
+                    }
+
+                    if (Node.TriangleCount > 0) // BLAS leaf
+                    {
+                        for (uint j = Node.LeftOrFirst; j < Node.LeftOrFirst + Node.TriangleCount; ++j)
+                        {
+                            // Skip light triangles — they are the shadow ray target, not occluders
+                            if (any(Materials[SceneTriangles[j].MaterialIndex].Emissive > 0.0f))
+                            {
+                                continue;
+                            }
+
+                            float T = 0.0f;
+                            if (RayTriangleIntersect(LocalOrigin, LocalDir,
+                                    SceneTriangles[j].V0, SceneTriangles[j].V1, SceneTriangles[j].V2, T)
+                                && T < InMaxT)
+                            {
+                                return true; // occluded
+                            }
+                        }
+                    }
+                    else // BLAS internal — push children
+                    {
+                        BLASStack[BLASTop++] = (int)Node.LeftOrFirst;
+                        BLASStack[BLASTop++] = (int)Node.LeftOrFirst + 1;
+                    }
                 }
             }
         }
-        else
+        else // TLAS internal — push children
         {
-            Stack[StackTop++] = (int)Node.LeftOrFirst;
-            Stack[StackTop++] = (int)Node.LeftOrFirst + 1;
+            TLASStack[TLASTop++] = (int)TLASNode.LeftOrFirst;
+            TLASStack[TLASTop++] = (int)TLASNode.LeftOrFirst + 1;
         }
     }
 
@@ -390,14 +496,20 @@ float3 PathTrace(float3 InRayOrigin, float3 InRayDir, inout uint InOutRng)
 
     for (int Bounce = 0; Bounce < MaxBounces; ++Bounce)
     {
-        float T        = 0.0f;
-        int   TriIndex = 0;
-        
-        if (TraceRay(RayOrigin, RayDir, T, TriIndex))
+        float T         = 0.0f;
+        int   TriIndex  = 0;
+        int   InstIndex = -1;
+
+        if (TraceRay(RayOrigin, RayDir, T, TriIndex, InstIndex))
         {
             RtTriangle Tri = SceneTriangles[TriIndex];
             RtMaterial Mat = Materials[Tri.MaterialIndex];
             float3 HitPoint = RayOrigin + T * RayDir;
+
+            // Transform the local-space triangle normal to world space using the hit instance's
+            // rotation (upper 3×3 of Transform). For rotation+translation (no scale), normals
+            // transform by the same rotation matrix as points — no transpose-inverse needed.
+            Tri.Normal = normalize(mul((float3x3)Instances[InstIndex].Transform, Tri.Normal));
 
             HitPayload Payload = ClosestHit(Tri, Mat, HitPoint, Throughput, Bounce, InOutRng);
             Radiance += Payload.Radiance;

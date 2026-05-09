@@ -47,3 +47,32 @@ struct RtBVHNode
     uint32_t TriangleCount;  // 0 = internal, >0 = leaf
 };
 static_assert(sizeof(RtBVHNode) == 32, "RtBVHNode size mismatch between CPU and GPU");
+
+// TLAS node — must exactly mirror RtTLASNode in RayGen.hlsl.
+// Identical memory layout to RtBVHNode; leaves index into the instance list instead of triangles.
+// InstanceCount == 0 → internal node: LeftOrFirst is the left child index (right = left+1).
+// InstanceCount  > 0 → leaf node:     LeftOrFirst is the first instance index.
+struct RtTLASNode
+{
+    float    Min[3];          // AABB min (world space)
+    uint32_t LeftOrFirst;     // see above
+    float    Max[3];          // AABB max (world space)
+    uint32_t InstanceCount;   // 0 = internal, >0 = leaf
+};
+static_assert(sizeof(RtTLASNode) == 32, "RtTLASNode size mismatch between CPU and GPU");
+
+// Instance entry — must exactly mirror RtInstance in RayGen.hlsl.
+// Transforms are 3×4 row-major matrices using the column-vector convention (matching DXR):
+//   world_pos = Transform    * float4(local_pos, 1)
+//   local_pos = InvTransform * float4(world_pos, 1)
+// Assumption: instances use only rotation + translation (no non-uniform scale).
+// This guarantees T is preserved when crossing spaces, and normals need only
+// the upper 3×3 of Transform (transpose of inverse = forward rotation for rigid bodies).
+struct RtInstance
+{
+    float    Transform[12];    // 3×4 row-major, local→world: used to bring normals to world space
+    float    InvTransform[12]; // 3×4 row-major, world→local: used to transform rays into local space
+    uint32_t BLASRootNode;     // root node index in the shared BVH node buffer
+    uint32_t TriangleOffset;   // first triangle index in the shared triangle buffer
+};
+static_assert(sizeof(RtInstance) == 104, "RtInstance size mismatch between CPU and GPU");

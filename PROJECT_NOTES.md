@@ -25,10 +25,11 @@ Target platform: **Windows only**.
 
 No file I/O for assets. All geometry and material data defined as C++ structs and uploaded to GPU buffers at startup.
 
-**Scene contents:**
-- 5 quads: back wall, floor, ceiling, left wall (red), right wall (green)
-- 1 area light: ceiling panel (emissive)
-- 2 boxes inside the room (tall & short) — can defer to later milestone
+**Scene contents (current):**
+- Mesh 0 — Room: 5 quads (back wall, floor, ceiling, left wall red, right wall green) + ceiling area light; world space, identity transform
+- Mesh 1 — Tall box: local-space AABB (0.30×0.30×1.20), 15° CW Y-rotation, placed right-back
+- Mesh 2 — Short box: local-space AABB (0.30×0.30×0.60), 15° CCW Y-rotation, placed left-front
+- Each mesh has its own BLAS; one RtInstance per mesh (1-to-1, to be decoupled in Milestone 10)
 
 **Material properties per surface:**
 - Albedo (diffuse color RGB)
@@ -56,11 +57,14 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 | 8b | RtLight GPU buffer — light data moved from shader constants to StructuredBuffer<RtLight>, injected from RtSampleScene | ✅ Done |
 | 8c | AddLight refactor — single AddLight(V0,V1,V2,V3,Normal,Emissive) call registers both geometry and light buffer entry; MatLight and duplicate AddQuad removed from BuildCornellBox | ✅ Done |
 | 8d | Shader refactor — RayGen.hlsl reorganized into DXR-role sections: [Utilities], [Intersection], [Miss], [Closest Hit] (HitPayload struct + ClosestHit()), [Path Tracer], [Ray Generation]; SkyColor renamed to Miss | ✅ Done |
-| 9a | BLAS/TLAS data structures — RtInstance, RtTLASNode structs in RtSceneTypes.h with static_asserts | 🔲 Planned |
-| 9b | Scene restructure — introduce RtMesh concept; Cornell Box walls + each box become separate meshes with triangle ranges | 🔲 Planned |
-| 9c | Per-mesh BLAS build — run BVH build per mesh over its triangle range; store node arrays consecutively with per-mesh offsets | 🔲 Planned |
-| 9d | TLAS build — second BVH over world-space instance AABBs; each leaf points to an instance → BLAS | 🔲 Planned |
-| 9e | Two-phase shader traversal — TraceRay + TraceShadow walk TLAS first, transform ray into instance local space, then walk BLAS | 🔲 Planned |
+| 9a | BLAS/TLAS data structures — RtInstance (row_major float3x4 transforms, BLASRootNode, TriangleOffset) and RtTLASNode structs in RtSceneTypes.h + RayGen.hlsl with static_asserts | ✅ Done |
+| 9b | Scene restructure — RtMesh (TriangleOffset, TriangleCount, BLASRootNode, Transform, InvTransform); BeginMesh/EndMesh helpers; BuildCornellBox splits into 3 meshes: room, tall box, short box | ✅ Done |
+| 9c | Per-mesh BLAS build — BuildBLAS() loops over Meshes, builds per-mesh BVH into consecutive BVHNodes slots, populates Instances list; shader TraceRay/TraceShadow loop over instances using Inst.BLASRootNode; InstanceBuffer GPU resource added (t4, root slot [6], InstanceCount root constant) | ✅ Done |
+| 9d | TLAS build — BuildTLAS() + SubdivideTLASNode() builds BVH over instance world-space AABBs (from BLAS root bounds); may reorder Instances array so InstanceBuffer uploaded after; TLASNodeBuffer GPU resource added (t5, root slot [7]); shader TraceRay/TraceShadow replaced with two-level TLAS→BLAS traversal using separate TLASStack[32] + BLASStack[32] | ✅ Done |
+| 9e | Two-phase shader traversal — AddBox generates local-space AABB vertices + axis-aligned normals; FillBoxTransforms computes real Y-rotation + translation matrices; SubdivideTLASNode transforms BLAS root corners to world space for correct AABB/centroid; TraceRay/TraceShadow transform ray to local space per instance (mul InvTransform) before BLAS walk; PathTrace transforms hit normal to world space (mul upper 3×3 of Transform) before ClosestHit | ✅ Done |
+| 10a | Instance/mesh decoupling — remove auto-instance generation from BuildBLAS(); add AddInstance(MeshIdx, T, InvT) so multiple instances can reference the same BLAS; BuildCornellBox registers instances explicitly | 🔲 Planned |
+| 10b | AddSphere helper — triangulated UV sphere (stacks × slices); local space, centered at origin; new mesh type alongside AddBox | 🔲 Planned |
+| 10c | Scene population — enrich Cornell Box interior using instancing (shared BLASes for identical-sized boxes) and new sphere meshes; vary materials | 🔲 Planned |
 
 ---
 
@@ -70,9 +74,15 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 > No RTX APIs — must run on non-RTX hardware. Windows only, HLSL.  
 > Sample scene is a **Cornell Box hardcoded in C++** (no asset import pipeline).  
 > Local workspace: `D:\PRGStudy\Rita`  
-> Current milestone: **Milestone 8d complete — Shader refactor (DXR-role sections)**  
-> Last thing completed: RayGen.hlsl reorganized into clearly labeled DXR-equivalent sections. ClosestHit() extracted from PathTrace with HitPayload return struct (Radiance, Throughput, NextRayOrigin, NextRayDir, bTerminate). PathTrace bounce loop now only calls TraceRay → Miss or ClosestHit — no shading logic inline. SkyColor renamed to Miss. Section headers: [Utilities], [Intersection], [Miss Shader], [Closest Hit Shader], [Path Tracer], [Ray Generation]. NEE toggle: #define RITA_RAYGEN_NEE 0/1. Code style: Rt prefix on classes, Unreal-style PascalCase members, In prefix on parameters, braces on all control flow bodies.  
-> Next up: Milestone 9 — Two-level BVH (BLAS + TLAS). Per-mesh BVH built in local space (BLAS), top-level BVH over instances with 4×4 transforms (TLAS). Shader traversal becomes two-phase: test TLAS AABBs, transform ray into instance local space, traverse BLAS.
+> Current milestone: **Milestone 9 fully complete — BLAS/TLAS two-level BVH with real transforms**  
+> Last thing completed (9e): AddBox generates local-space AABB vertices (bottom at y=0, top at y=Height, centered at origin in XZ, axis-aligned normals). FillBoxTransforms() computes the real 3×4 row-major local→world [R|t] and world→local [R^T|-R^T·t] matrices for Y-rotation + translation. BuildCornellBox calls FillBoxTransforms then EndMesh(T,InvT) per box mesh. SubdivideTLASNode uses ExpandWorldAABBByTransformedCorners() (all 8 BLAS-root corners transformed to world space) for node AABB and partition centroid. TraceRay/TraceShadow transform each ray to local space (mul(InvTransform, float4(origin,1)) + mul((float3x3)InvTransform, dir)) before BLAS traversal — T invariant because rotation preserves direction length. TraceRay returns OutInstIndex. PathTrace transforms local normal to world space (normalize(mul((float3x3)Transform, n))) before ClosestHit.  
+>  
+> **Current architecture note:** BuildBLAS() auto-generates exactly one RtInstance per RtMesh — instances and meshes are currently 1-to-1 coupled. To reuse the same BLAS for multiple instances (true GPU instancing), this coupling needs to be broken (Milestone 10a).  
+>  
+> Next up: **Milestone 10 — Scene extension**  
+> 10a: Decouple instances from meshes — remove auto-generation from BuildBLAS(), add AddInstance(MeshIdx, T, InvT), BuildCornellBox registers instances explicitly.  
+> 10b: AddSphere helper — triangulated UV sphere in local space (stacks × slices).  
+> 10c: Enrich scene — more boxes via instancing (shared BLAS), sphere(s), varied materials.
 
 ---
 

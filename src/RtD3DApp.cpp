@@ -266,13 +266,16 @@ bool RtD3DApp::InitCompute()
     // [1] Root SRV at t0 (triangle structured buffer)
     // [2] Root SRV at t1 (BVH node structured buffer)
     // [3] Root SRV at t2 (material structured buffer)
-    // [4] Root constants at b0 — FrameIndex (1 × 32-bit)
+    // [4] Root constants at b0 — FrameIndex, LightCount, InstanceCount (3 × 32-bit)
+    // [5] Root SRV at t3 (light structured buffer)
+    // [6] Root SRV at t4 (instance structured buffer)
+    // [7] Root SRV at t5 (TLAS node structured buffer)
     D3D12_DESCRIPTOR_RANGE UavRange = {};
     UavRange.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     UavRange.NumDescriptors     = 2; // u0 + u1
     UavRange.BaseShaderRegister = 0;
 
-    D3D12_ROOT_PARAMETER RootParams[6] = {};
+    D3D12_ROOT_PARAMETER RootParams[8] = {};
 
     RootParams[0].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     RootParams[0].DescriptorTable.NumDescriptorRanges = 1;
@@ -292,17 +295,25 @@ bool RtD3DApp::InitCompute()
     RootParams[3].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
     RootParams[4].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    RootParams[4].Constants.ShaderRegister = 0; // b0 — FrameIndex, LightCount
+    RootParams[4].Constants.ShaderRegister = 0; // b0 — FrameIndex, LightCount, InstanceCount
     RootParams[4].Constants.RegisterSpace  = 0;
-    RootParams[4].Constants.Num32BitValues = 2;
+    RootParams[4].Constants.Num32BitValues = 3;
     RootParams[4].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
 
     RootParams[5].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
     RootParams[5].Descriptor.ShaderRegister = 3; // t3 — lights
     RootParams[5].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
+    RootParams[6].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    RootParams[6].Descriptor.ShaderRegister = 4; // t4 — instances
+    RootParams[6].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+    RootParams[7].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    RootParams[7].Descriptor.ShaderRegister = 5; // t5 — TLAS nodes
+    RootParams[7].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_ROOT_SIGNATURE_DESC RootSigDesc = {};
-    RootSigDesc.NumParameters = 6;
+    RootSigDesc.NumParameters = 8;
     RootSigDesc.pParameters   = RootParams;
 
     ComPtr<ID3DBlob> SerializedRootSig, ErrorBlob;
@@ -470,12 +481,18 @@ void RtD3DApp::DispatchCompute(ID3D12GraphicsCommandList* InCmd)
     // [3] Material buffer
     InCmd->SetComputeRootShaderResourceView(3, SampleScene.GetMaterialBufferGPUAddress());
 
-    // [4] Root constants: FrameIndex + LightCount
-    const uint32_t RootConsts[2] = { FrameAccumCount, SampleScene.GetLightCount() };
-    InCmd->SetComputeRoot32BitConstants(4, 2, RootConsts, 0);
+    // [4] Root constants: FrameIndex, LightCount, InstanceCount
+    const uint32_t RootConsts[3] = { FrameAccumCount, SampleScene.GetLightCount(), SampleScene.GetInstanceCount() };
+    InCmd->SetComputeRoot32BitConstants(4, 3, RootConsts, 0);
 
     // [5] Light buffer
     InCmd->SetComputeRootShaderResourceView(5, SampleScene.GetLightBufferGPUAddress());
+
+    // [6] Instance buffer
+    InCmd->SetComputeRootShaderResourceView(6, SampleScene.GetInstanceBufferGPUAddress());
+
+    // [7] TLAS node buffer
+    InCmd->SetComputeRootShaderResourceView(7, SampleScene.GetTLASNodeBufferGPUAddress());
 
     const uint32_t GroupsX = (DisplayWidth  + 7) / 8;
     const uint32_t GroupsY = (DisplayHeight + 7) / 8;

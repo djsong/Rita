@@ -10,6 +10,51 @@
     if (FAILED(hr)) { throw std::runtime_error("D3D12 call failed at " __FILE__ ":" + std::to_string(__LINE__)); }
 
 // ---------------------------------------------------------------------------
+// Fills a 3×4 row-major matrix with the identity transform.
+// Row-major layout: [1,0,0,0 | 0,1,0,0 | 0,0,1,0]
+// ---------------------------------------------------------------------------
+static void FillIdentityTransform(float OutT[12])
+{
+    memset(OutT, 0, 48);
+    OutT[0]  = 1.0f; // row 0, col 0
+    OutT[5]  = 1.0f; // row 1, col 1
+    OutT[10] = 1.0f; // row 2, col 2
+}
+
+// ---------------------------------------------------------------------------
+// Fills the local→world and world→local 3×4 row-major matrix pair for a box mesh.
+// The box is placed with its local origin (bottom) at world y = -1,
+// translated to (InCenterX, InCenterZ) in XZ, and rotated around Y by InRotationDeg.
+//
+// Transform  (local→world):  [R | t]        where R = Y-rotation, t = (CenterX, -1, CenterZ)
+// InvTransform (world→local): [R^T | -R^T*t]  (exact inverse for rotation+translation)
+// ---------------------------------------------------------------------------
+static void FillBoxTransforms(
+    float InCenterX, float InCenterZ, float InRotationDeg,
+    float OutTransform[12], float OutInvTransform[12])
+{
+    const float Rad = InRotationDeg * 3.14159265f / 180.0f;
+    const float C   = cosf(Rad);
+    const float S   = sinf(Rad);
+
+    // Local→world:
+    //   Row 0: [ C,  0, -S, CenterX ]
+    //   Row 1: [ 0,  1,  0, -1      ]
+    //   Row 2: [ S,  0,  C, CenterZ ]
+    OutTransform[0]  =  C;    OutTransform[1]  = 0.0f; OutTransform[2]  = -S;   OutTransform[3]  = InCenterX;
+    OutTransform[4]  = 0.0f;  OutTransform[5]  = 1.0f; OutTransform[6]  = 0.0f; OutTransform[7]  = -1.0f;
+    OutTransform[8]  =  S;    OutTransform[9]  = 0.0f; OutTransform[10] =  C;   OutTransform[11] = InCenterZ;
+
+    // World→local: [R^T | -R^T*t], t = (CenterX, -1, CenterZ)
+    //   Row 0: [ C,  0,  S, -(C*CenterX + S*CenterZ) ]
+    //   Row 1: [ 0,  1,  0,  1                        ]
+    //   Row 2: [-S,  0,  C,   S*CenterX - C*CenterZ   ]
+    OutInvTransform[0]  =  C;    OutInvTransform[1]  = 0.0f; OutInvTransform[2]  =  S;   OutInvTransform[3]  = -(C*InCenterX + S*InCenterZ);
+    OutInvTransform[4]  = 0.0f;  OutInvTransform[5]  = 1.0f; OutInvTransform[6]  = 0.0f; OutInvTransform[7]  =  1.0f;
+    OutInvTransform[8]  = -S;    OutInvTransform[9]  = 0.0f; OutInvTransform[10] =  C;   OutInvTransform[11] =  S*InCenterX - C*InCenterZ;
+}
+
+// ---------------------------------------------------------------------------
 // Cornell Box material colors
 // ---------------------------------------------------------------------------
 
@@ -27,60 +72,106 @@ static constexpr float NO_EMIT[] = {  0.0f,  0.0f,  0.0f };
 
 void RtSampleScene::BuildCornellBox()
 {
-    // Register all materials up front; keep indices as named constants for clarity
+    // Register materials up front — shared across all meshes; indices stay valid
+    // regardless of mesh ordering since materials are a separate buffer.
     const uint32_t MatWhite = AddMaterial(WHITE, NO_EMIT);
     const uint32_t MatRed   = AddMaterial(RED,   NO_EMIT);
     const uint32_t MatGreen = AddMaterial(GREEN, NO_EMIT);
 
-    // Back wall — white, z=2, normal (0,0,-1)
+    // --- Mesh 0: Room ---
+    // Back wall, floor, ceiling, left/right walls, ceiling light panel.
+    // All geometry is in world space — identity transform.
+    BeginMesh();
     {
-        const float N[]  = { 0, 0, -1 };
-        const float V0[] = { -1, -1, 2 }, V1[] = { 1, -1, 2 }, V2[] = { 1, 1, 2 }, V3[] = { -1, 1, 2 };
-        AddQuad(V0, V1, V2, V3, N, MatWhite);
+        // Back wall — white, z=2, normal (0,0,-1)
+        {
+            const float N[]  = { 0, 0, -1 };
+            const float V0[] = { -1, -1, 2 }, V1[] = { 1, -1, 2 }, V2[] = { 1, 1, 2 }, V3[] = { -1, 1, 2 };
+            AddQuad(V0, V1, V2, V3, N, MatWhite);
+        }
+
+        // Floor — white, y=-1, normal (0,1,0)
+        {
+            const float N[]  = { 0, 1, 0 };
+            const float V0[] = { -1, -1, 0 }, V1[] = { 1, -1, 0 }, V2[] = { 1, -1, 2 }, V3[] = { -1, -1, 2 };
+            AddQuad(V0, V1, V2, V3, N, MatWhite);
+        }
+
+        // Ceiling — white, y=1, normal (0,-1,0)
+        {
+            const float N[]  = { 0, -1, 0 };
+            const float V0[] = { -1, 1, 2 }, V1[] = { 1, 1, 2 }, V2[] = { 1, 1, 0 }, V3[] = { -1, 1, 0 };
+            AddQuad(V0, V1, V2, V3, N, MatWhite);
+        }
+
+        // Left wall — red, x=-1, normal (1,0,0)
+        {
+            const float N[]  = { 1, 0, 0 };
+            const float V0[] = { -1, -1, 2 }, V1[] = { -1, -1, 0 }, V2[] = { -1, 1, 0 }, V3[] = { -1, 1, 2 };
+            AddQuad(V0, V1, V2, V3, N, MatRed);
+        }
+
+        // Right wall — green, x=1, normal (-1,0,0)
+        {
+            const float N[]  = { -1, 0, 0 };
+            const float V0[] = { 1, -1, 0 }, V1[] = { 1, -1, 2 }, V2[] = { 1, 1, 2 }, V3[] = { 1, 1, 0 };
+            AddQuad(V0, V1, V2, V3, N, MatGreen);
+        }
+
+        // Ceiling light — emissive quad, slightly below y=1 so it doesn't z-fight the ceiling.
+        // AddLight registers both the visible geometry and the samplable area light entry.
+        {
+            const float N[]  = { 0, -1, 0 };
+            const float V0[] = { -0.3f, 0.99f, 0.8f }, V1[] = {  0.3f, 0.99f, 0.8f },
+                        V2[] = {  0.3f, 0.99f, 1.2f }, V3[] = { -0.3f, 0.99f, 1.2f };
+            AddLight(V0, V1, V2, V3, N, LIGHT);
+        }
+    }
+    EndMesh();
+
+    // --- Mesh 1: Tall box ---
+    // Right-back area, 15° CW rotation around Y, reaches ~60% of room height.
+    // Geometry is in local space (AABB centered at origin); transform places it in the scene.
+    {
+        float T[12], InvT[12];
+        FillBoxTransforms(0.33f, 1.4f, 15.0f, T, InvT);
+        BeginMesh();
+        AddBox(0.30f, 0.30f, 1.2f, MatWhite);
+        EndMesh(T, InvT);
     }
 
-    // Floor — white, y=-1, normal (0,1,0)
+    // --- Mesh 2: Short box ---
+    // Left-front area, 15° CCW rotation around Y, reaches ~30% of room height.
     {
-        const float N[]  = { 0, 1, 0 };
-        const float V0[] = { -1, -1, 0 }, V1[] = { 1, -1, 0 }, V2[] = { 1, -1, 2 }, V3[] = { -1, -1, 2 };
-        AddQuad(V0, V1, V2, V3, N, MatWhite);
+        float T[12], InvT[12];
+        FillBoxTransforms(-0.32f, 1.0f, -15.0f, T, InvT);
+        BeginMesh();
+        AddBox(0.30f, 0.30f, 0.6f, MatWhite);
+        EndMesh(T, InvT);
     }
+}
 
-    // Ceiling — white, y=1, normal (0,-1,0)
-    {
-        const float N[]  = { 0, -1, 0 };
-        const float V0[] = { -1, 1, 2 }, V1[] = { 1, 1, 2 }, V2[] = { 1, 1, 0 }, V3[] = { -1, 1, 0 };
-        AddQuad(V0, V1, V2, V3, N, MatWhite);
-    }
+void RtSampleScene::BeginMesh()
+{
+    CurrentMeshStart = static_cast<uint32_t>(Triangles.size());
+}
 
-    // Left wall — red, x=-1, normal (1,0,0)
-    {
-        const float N[]  = { 1, 0, 0 };
-        const float V0[] = { -1, -1, 2 }, V1[] = { -1, -1, 0 }, V2[] = { -1, 1, 0 }, V3[] = { -1, 1, 2 };
-        AddQuad(V0, V1, V2, V3, N, MatRed);
-    }
+void RtSampleScene::EndMesh()
+{
+    float Identity[12];
+    FillIdentityTransform(Identity);
+    EndMesh(Identity, Identity);
+}
 
-    // Right wall — green, x=1, normal (-1,0,0)
-    {
-        const float N[]  = { -1, 0, 0 };
-        const float V0[] = { 1, -1, 0 }, V1[] = { 1, -1, 2 }, V2[] = { 1, 1, 2 }, V3[] = { 1, 1, 0 };
-        AddQuad(V0, V1, V2, V3, N, MatGreen);
-    }
-
-    // Ceiling light — emissive quad, slightly below y=1 so it doesn't z-fight the ceiling.
-    // AddLight registers both the visible geometry and the samplable area light entry.
-    {
-        const float N[]  = { 0, -1, 0 };
-        const float V0[] = { -0.3f, 0.99f, 0.8f }, V1[] = {  0.3f, 0.99f, 0.8f },
-                    V2[] = {  0.3f, 0.99f, 1.2f }, V3[] = { -0.3f, 0.99f, 1.2f };
-        AddLight(V0, V1, V2, V3, N, LIGHT);
-    }
-
-    // Tall box — right-back area, 15° CW rotation, reaches ~60% of room height
-    AddBox( 0.33f, 1.4f,  0.30f, 0.30f,  1.2f,  15.0f, MatWhite);
-
-    // Short box — left-front area, 15° CCW rotation, reaches ~30% of room height
-    AddBox(-0.32f, 1.0f,  0.30f, 0.30f,  0.6f, -15.0f, MatWhite);
+void RtSampleScene::EndMesh(const float* InTransform, const float* InInvTransform)
+{
+    RtMesh Mesh         = {};
+    Mesh.TriangleOffset = CurrentMeshStart;
+    Mesh.TriangleCount  = static_cast<uint32_t>(Triangles.size()) - CurrentMeshStart;
+    Mesh.BLASRootNode   = 0; // set by BuildBLAS()
+    memcpy(Mesh.Transform,    InTransform,    48);
+    memcpy(Mesh.InvTransform, InInvTransform, 48);
+    Meshes.push_back(Mesh);
 }
 
 void RtSampleScene::AddLight(
@@ -144,63 +235,77 @@ void RtSampleScene::AddQuad(
 }
 
 void RtSampleScene::AddBox(
-    float InCenterX, float InCenterZ,
-    float InHalfX,   float InHalfZ,
-    float InHeight,
-    float InRotationDeg,
+    float    InHalfX, float    InHalfZ,
+    float    InHeight,
     uint32_t InMaterialIndex)
 {
-    const float Rad = InRotationDeg * 3.14159265f / 180.0f;
-    const float C   = cosf(Rad);
-    const float S   = sinf(Rad);
+    // Local-space AABB: centered at origin in XZ, bottom at y=0, top at y=InHeight.
+    // The world transform (Y-rotation + translation to floor) is stored in the mesh's
+    // RtInstance and applied by the shader at intersection time — see FillBoxTransforms.
+    const float Yb = 0.0f;
+    const float Yt = InHeight;
 
-    // Rotate local (Lx, Lz) around Y and translate to world space at height Wy
-    auto Corner = [&](float Lx, float Lz, float Wy, float OutV[3])
+    float Vb[4][3] =
     {
-        OutV[0] = InCenterX + Lx * C - Lz * S;
-        OutV[1] = Wy;
-        OutV[2] = InCenterZ + Lx * S + Lz * C;
+        { -InHalfX, Yb, -InHalfZ },  // 0: left-near  bottom
+        {  InHalfX, Yb, -InHalfZ },  // 1: right-near bottom
+        {  InHalfX, Yb,  InHalfZ },  // 2: right-far  bottom
+        { -InHalfX, Yb,  InHalfZ }   // 3: left-far   bottom
+    };
+    float Vt[4][3] =
+    {
+        { -InHalfX, Yt, -InHalfZ },  // 0: left-near  top
+        {  InHalfX, Yt, -InHalfZ },  // 1: right-near top
+        {  InHalfX, Yt,  InHalfZ },  // 2: right-far  top
+        { -InHalfX, Yt,  InHalfZ }   // 3: left-far   top
     };
 
-    const float Yb = -1.0f;             // bottom y — sits on the floor
-    const float Yt = -1.0f + InHeight;  // top y
+    // Axis-aligned outward normals in local space
+    const float NNear[3]  = {  0.0f, 0.0f, -1.0f };  // -Z face
+    const float NRight[3] = {  1.0f, 0.0f,  0.0f };  // +X face
+    const float NFar[3]   = {  0.0f, 0.0f,  1.0f };  // +Z face
+    const float NLeft[3]  = { -1.0f, 0.0f,  0.0f };  // -X face
+    const float NTop[3]   = {  0.0f, 1.0f,  0.0f };  // +Y face
 
-    // 4 corners in local XZ, going: left-near, right-near, right-far, left-far
-    // ("near" = lower z before rotation, i.e. closer to camera)
-    float Vb[4][3], Vt[4][3];
-    Corner(-InHalfX, -InHalfZ, Yb, Vb[0]);  Corner(-InHalfX, -InHalfZ, Yt, Vt[0]);
-    Corner( InHalfX, -InHalfZ, Yb, Vb[1]);  Corner( InHalfX, -InHalfZ, Yt, Vt[1]);
-    Corner( InHalfX,  InHalfZ, Yb, Vb[2]);  Corner( InHalfX,  InHalfZ, Yt, Vt[2]);
-    Corner(-InHalfX,  InHalfZ, Yb, Vb[3]);  Corner(-InHalfX,  InHalfZ, Yt, Vt[3]);
-
-    // Outward face normals — each unrotated axis normal rotated by the same θ around Y.
-    // Derivation: apply the Y-rotation matrix (cos θ, 0, -sin θ / 0,1,0 / sin θ, 0, cos θ).
-    const float NNear[3]  = {  S, 0.0f, -C };  // face 0-1, rotated (0,0,-1)
-    const float NRight[3] = {  C, 0.0f,  S };  // face 1-2, rotated (1,0,0)
-    const float NFar[3]   = { -S, 0.0f,  C };  // face 2-3, rotated (0,0,1)
-    const float NLeft[3]  = { -C, 0.0f, -S };  // face 3-0, rotated (-1,0,0)
-    const float NTop[3]   = {  0, 1.0f,  0 };  // top face
-
-    AddQuad(Vb[0], Vb[1], Vt[1], Vt[0], NNear,  InMaterialIndex); // near side
-    AddQuad(Vb[1], Vb[2], Vt[2], Vt[1], NRight, InMaterialIndex); // right side
-    AddQuad(Vb[2], Vb[3], Vt[3], Vt[2], NFar,   InMaterialIndex); // far side
-    AddQuad(Vb[3], Vb[0], Vt[0], Vt[3], NLeft,  InMaterialIndex); // left side
-    AddQuad(Vt[0], Vt[1], Vt[2], Vt[3], NTop,   InMaterialIndex); // top
+    AddQuad(Vb[0], Vb[1], Vt[1], Vt[0], NNear,  InMaterialIndex); // near face
+    AddQuad(Vb[1], Vb[2], Vt[2], Vt[1], NRight, InMaterialIndex); // right face
+    AddQuad(Vb[2], Vb[3], Vt[3], Vt[2], NFar,   InMaterialIndex); // far face
+    AddQuad(Vb[3], Vb[0], Vt[0], Vt[3], NLeft,  InMaterialIndex); // left face
+    AddQuad(Vt[0], Vt[1], Vt[2], Vt[3], NTop,   InMaterialIndex); // top face
 }
 
 // ---------------------------------------------------------------------------
-// BVH build — midpoint split along the longest AABB axis
+// BLAS build — one BVH per mesh, nodes stored consecutively in BVHNodes.
+// SubdivideBVHNode uses a midpoint split along the longest AABB axis.
 // ---------------------------------------------------------------------------
 
-void RtSampleScene::BuildBVH()
+void RtSampleScene::BuildBLAS()
 {
-    const uint32_t TriCount = static_cast<uint32_t>(Triangles.size());
-    BVHNodes.resize(2 * TriCount); // upper bound: 2N-1 nodes
+    const uint32_t TotalTriCount = static_cast<uint32_t>(Triangles.size());
+    BVHNodes.resize(2 * TotalTriCount); // upper bound: sum(2*Ni-1) <= 2*TotalN
     BVHNextFreeNode = 0;
 
-    SubdivideBVHNode(BVHNextFreeNode++, 0, TriCount);
+    // Build one BVH per mesh; each mesh's nodes follow the previous mesh's in BVHNodes.
+    for (RtMesh& Mesh : Meshes)
+    {
+        Mesh.BLASRootNode = BVHNextFreeNode++;
+        SubdivideBVHNode(Mesh.BLASRootNode, Mesh.TriangleOffset, Mesh.TriangleCount);
+    }
 
     BVHNodes.resize(BVHNextFreeNode); // trim to actual size
+
+    // Build one RtInstance per mesh so the GPU can locate each BLAS and its triangle range.
+    Instances.clear();
+    Instances.reserve(Meshes.size());
+    for (const RtMesh& Mesh : Meshes)
+    {
+        RtInstance Inst   = {};
+        memcpy(Inst.Transform,    Mesh.Transform,    48);
+        memcpy(Inst.InvTransform, Mesh.InvTransform, 48);
+        Inst.BLASRootNode   = Mesh.BLASRootNode;
+        Inst.TriangleOffset = Mesh.TriangleOffset;
+        Instances.push_back(Inst);
+    }
 }
 
 void RtSampleScene::SubdivideBVHNode(uint32_t InNodeIdx, uint32_t InTriFirst, uint32_t InTriCount)
@@ -208,7 +313,11 @@ void RtSampleScene::SubdivideBVHNode(uint32_t InNodeIdx, uint32_t InTriFirst, ui
     RtBVHNode& Node = BVHNodes[InNodeIdx];
 
     // Compute AABB over all triangles in [InTriFirst, InTriFirst+InTriCount)
-    for (int i = 0; i < 3; ++i) { Node.Min[i] = 1e30f; Node.Max[i] = -1e30f; }
+    for (int i = 0; i < 3; ++i) 
+    { 
+        Node.Min[i] = 1e30f; 
+        Node.Max[i] = -1e30f; 
+    }
     for (uint32_t i = InTriFirst; i < InTriFirst + InTriCount; ++i)
     {
         const float* Verts[3] = { Triangles[i].V0, Triangles[i].V1, Triangles[i].V2 };
@@ -281,6 +390,137 @@ void RtSampleScene::SubdivideBVHNode(uint32_t InNodeIdx, uint32_t InTriFirst, ui
 }
 
 // ---------------------------------------------------------------------------
+// Transforms all 8 corners of a local-space AABB through a 3×4 row-major matrix
+// and expands the caller's world-space AABB (WorldMin/WorldMax) to enclose them.
+// Used by SubdivideTLASNode to compute correct world-space bounds for rotated instances.
+// ---------------------------------------------------------------------------
+static void ExpandWorldAABBByTransformedCorners(
+    const float* T,         // [12] 3×4 row-major local→world matrix
+    const float* LocalMin,  // [3]  local AABB min
+    const float* LocalMax,  // [3]  local AABB max
+    float*       WorldMin,  // [3]  in/out world AABB min
+    float*       WorldMax)  // [3]  in/out world AABB max
+{
+    for (int CornerIdx = 0; CornerIdx < 8; ++CornerIdx)
+    {
+        const float Lx = (CornerIdx & 1) ? LocalMax[0] : LocalMin[0];
+        const float Ly = (CornerIdx & 2) ? LocalMax[1] : LocalMin[1];
+        const float Lz = (CornerIdx & 4) ? LocalMax[2] : LocalMin[2];
+
+        const float Wx = T[0]*Lx + T[1]*Ly + T[2]*Lz + T[3];
+        const float Wy = T[4]*Lx + T[5]*Ly + T[6]*Lz + T[7];
+        const float Wz = T[8]*Lx + T[9]*Ly + T[10]*Lz + T[11];
+
+        WorldMin[0] = min(WorldMin[0], Wx);  WorldMax[0] = max(WorldMax[0], Wx);
+        WorldMin[1] = min(WorldMin[1], Wy);  WorldMax[1] = max(WorldMax[1], Wy);
+        WorldMin[2] = min(WorldMin[2], Wz);  WorldMax[2] = max(WorldMax[2], Wz);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLAS build — BVH over world-space instance AABBs (taken from BLAS root bounds).
+// Instances may be reordered in-place during partitioning, so InstanceBuffer must
+// be uploaded after BuildTLAS, not after BuildBLAS.
+// ---------------------------------------------------------------------------
+
+void RtSampleScene::BuildTLAS()
+{
+    const uint32_t InstCount = static_cast<uint32_t>(Instances.size());
+    TLASNodes.resize(2 * InstCount); // upper bound: 2N-1 nodes
+    TLASNextFreeNode = 0;
+
+    SubdivideTLASNode(TLASNextFreeNode++, 0, InstCount);
+
+    TLASNodes.resize(TLASNextFreeNode); // trim to actual size
+}
+
+void RtSampleScene::SubdivideTLASNode(uint32_t InNodeIdx, uint32_t InInstFirst, uint32_t InInstCount)
+{
+    RtTLASNode& Node = TLASNodes[InNodeIdx];
+
+    // Compute world-space AABB over all instances in [InInstFirst, InInstFirst+InInstCount).
+    // Each instance's BLAS root bounds are in local space; we transform all 8 corners to
+    // world space via the instance's Transform and take the enclosing AABB.
+    for (int i = 0; i < 3; ++i)
+    {
+        Node.Min[i] =  1e30f;
+        Node.Max[i] = -1e30f;
+    }
+    for (uint32_t i = InInstFirst; i < InInstFirst + InInstCount; ++i)
+    {
+        const RtBVHNode& BLASRoot = BVHNodes[Instances[i].BLASRootNode];
+        ExpandWorldAABBByTransformedCorners(
+            Instances[i].Transform,
+            BLASRoot.Min, BLASRoot.Max,
+            Node.Min, Node.Max);
+    }
+
+    // Leaf: one instance, no point splitting further
+    if (InInstCount <= 1)
+    {
+        Node.LeftOrFirst   = InInstFirst;
+        Node.InstanceCount = InInstCount;
+        return;
+    }
+
+    // Find the longest axis of the combined AABB
+    int   SplitAxis = 0;
+    float MaxExtent = Node.Max[0] - Node.Min[0];
+    for (int i = 1; i < 3; ++i)
+    {
+        const float Extent = Node.Max[i] - Node.Min[i];
+        if (Extent > MaxExtent) { MaxExtent = Extent; SplitAxis = i; }
+    }
+
+    // Partition instances around the centroid midpoint on SplitAxis.
+    // Centroid = midpoint of each instance's BLAS root AABB on SplitAxis.
+    const float MidPoint = 0.5f * (Node.Min[SplitAxis] + Node.Max[SplitAxis]);
+
+    int Left  = static_cast<int>(InInstFirst);
+    int Right = static_cast<int>(InInstFirst + InInstCount) - 1;
+    while (Left <= Right)
+    {
+        // Compute the world-space centroid of this instance along SplitAxis
+        const RtBVHNode& BLASRoot = BVHNodes[Instances[Left].BLASRootNode];
+        float WMin[3] = { 1e30f, 1e30f, 1e30f };
+        float WMax[3] = { -1e30f, -1e30f, -1e30f };
+        ExpandWorldAABBByTransformedCorners(
+            Instances[Left].Transform,
+            BLASRoot.Min, BLASRoot.Max,
+            WMin, WMax);
+        const float Centroid = 0.5f * (WMin[SplitAxis] + WMax[SplitAxis]);
+        if (Centroid <= MidPoint)
+        {
+            ++Left;
+        }
+        else
+        {
+            std::swap(Instances[Left], Instances[Right--]);
+        }
+    }
+
+    const uint32_t LeftCount = static_cast<uint32_t>(Left) - InInstFirst;
+
+    // Degenerate split fallback — make a leaf to avoid infinite recursion
+    if (LeftCount == 0 || LeftCount == InInstCount)
+    {
+        Node.LeftOrFirst   = InInstFirst;
+        Node.InstanceCount = InInstCount;
+        return;
+    }
+
+    // Allocate left and right child slots (always consecutive)
+    const uint32_t LeftChildIdx  = TLASNextFreeNode++;
+    const uint32_t RightChildIdx = TLASNextFreeNode++;
+
+    Node.LeftOrFirst   = LeftChildIdx; // RightChild = LeftChildIdx + 1
+    Node.InstanceCount = 0;            // internal node
+
+    SubdivideTLASNode(LeftChildIdx,  InInstFirst,             LeftCount);
+    SubdivideTLASNode(RightChildIdx, InInstFirst + LeftCount, InInstCount - LeftCount);
+}
+
+// ---------------------------------------------------------------------------
 // GPU upload helper
 // ---------------------------------------------------------------------------
 
@@ -343,7 +583,8 @@ void RtSampleScene::UploadBuffer(
 bool RtSampleScene::Initialize(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCmd)
 {
     BuildCornellBox();
-    BuildBVH(); // reorders Triangles in-place, fills BVHNodes
+    BuildBLAS();  // reorders Triangles within each mesh's range, fills BVHNodes + Instances
+    BuildTLAS();  // may reorder Instances, fills TLASNodes — must run before InstanceBuffer upload
 
     UploadBuffer(InDevice, InCmd,
         Triangles.data(),
@@ -369,6 +610,18 @@ bool RtSampleScene::Initialize(ID3D12Device* InDevice, ID3D12GraphicsCommandList
         TEXT("Rita::LightBuffer"),
         LightBuffer, LightUploadBuffer);
 
+    UploadBuffer(InDevice, InCmd,
+        Instances.data(),
+        static_cast<uint32_t>(Instances.size() * sizeof(RtInstance)),
+        TEXT("Rita::InstanceBuffer"),
+        InstanceBuffer, InstanceUploadBuffer);
+
+    UploadBuffer(InDevice, InCmd,
+        TLASNodes.data(),
+        static_cast<uint32_t>(TLASNodes.size() * sizeof(RtTLASNode)),
+        TEXT("Rita::TLASNodeBuffer"),
+        TLASNodeBuffer, TLASNodeUploadBuffer);
+
     return true;
 }
 
@@ -386,10 +639,17 @@ void RtSampleScene::Shutdown()
     MaterialUploadBuffer.Reset();
     LightBuffer.Reset();
     LightUploadBuffer.Reset();
+    InstanceBuffer.Reset();
+    InstanceUploadBuffer.Reset();
+    TLASNodeBuffer.Reset();
+    TLASNodeUploadBuffer.Reset();
     Triangles.clear();
     BVHNodes.clear();
     Materials.clear();
     Lights.clear();
+    Meshes.clear();
+    Instances.clear();
+    TLASNodes.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -419,4 +679,19 @@ D3D12_GPU_VIRTUAL_ADDRESS RtSampleScene::GetLightBufferGPUAddress() const
 uint32_t RtSampleScene::GetLightCount() const
 {
     return static_cast<uint32_t>(Lights.size());
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS RtSampleScene::GetInstanceBufferGPUAddress() const
+{
+    return InstanceBuffer->GetGPUVirtualAddress();
+}
+
+uint32_t RtSampleScene::GetInstanceCount() const
+{
+    return static_cast<uint32_t>(Instances.size());
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS RtSampleScene::GetTLASNodeBufferGPUAddress() const
+{
+    return TLASNodeBuffer->GetGPUVirtualAddress();
 }
