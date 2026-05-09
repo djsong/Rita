@@ -55,7 +55,12 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 | 8 | Next event estimation — TraceShadow() + SampleLightPoint(), direct contribution at every bounce | ✅ Done |
 | 8b | RtLight GPU buffer — light data moved from shader constants to StructuredBuffer<RtLight>, injected from RtSampleScene | ✅ Done |
 | 8c | AddLight refactor — single AddLight(V0,V1,V2,V3,Normal,Emissive) call registers both geometry and light buffer entry; MatLight and duplicate AddQuad removed from BuildCornellBox | ✅ Done |
-| 9 | Two-level BVH (BLAS + TLAS) — per-mesh local BVH + instance transforms | 🔲 Planned |
+| 8d | Shader refactor — RayGen.hlsl reorganized into DXR-role sections: [Utilities], [Intersection], [Miss], [Closest Hit] (HitPayload struct + ClosestHit()), [Path Tracer], [Ray Generation]; SkyColor renamed to Miss | ✅ Done |
+| 9a | BLAS/TLAS data structures — RtInstance, RtTLASNode structs in RtSceneTypes.h with static_asserts | 🔲 Planned |
+| 9b | Scene restructure — introduce RtMesh concept; Cornell Box walls + each box become separate meshes with triangle ranges | 🔲 Planned |
+| 9c | Per-mesh BLAS build — run BVH build per mesh over its triangle range; store node arrays consecutively with per-mesh offsets | 🔲 Planned |
+| 9d | TLAS build — second BVH over world-space instance AABBs; each leaf points to an instance → BLAS | 🔲 Planned |
+| 9e | Two-phase shader traversal — TraceRay + TraceShadow walk TLAS first, transform ray into instance local space, then walk BLAS | 🔲 Planned |
 
 ---
 
@@ -65,8 +70,8 @@ No file I/O for assets. All geometry and material data defined as C++ structs an
 > No RTX APIs — must run on non-RTX hardware. Windows only, HLSL.  
 > Sample scene is a **Cornell Box hardcoded in C++** (no asset import pipeline).  
 > Local workspace: `D:\PRGStudy\Rita`  
-> Current milestone: **Milestone 8c complete — AddLight refactor**  
-> Last thing completed: Light data fully refactored. RtLight GPU buffer (StructuredBuffer<RtLight> at t3) carries Corner/EdgeU/EdgeV/Normal/Emissive/Area per light, injected from RtSampleScene. AddLight(V0,V1,V2,V3,Normal,Emissive) now registers both visible geometry (via internal AddQuad) and the area light entry in one call — the separate MatLight material and duplicate AddQuad in BuildCornellBox have been removed. NEE toggle: #define RITA_RAYGEN_NEE 0/1. Code style: Rt prefix on classes, Unreal-style PascalCase members, In prefix on parameters, braces on all control flow bodies.  
+> Current milestone: **Milestone 8d complete — Shader refactor (DXR-role sections)**  
+> Last thing completed: RayGen.hlsl reorganized into clearly labeled DXR-equivalent sections. ClosestHit() extracted from PathTrace with HitPayload return struct (Radiance, Throughput, NextRayOrigin, NextRayDir, bTerminate). PathTrace bounce loop now only calls TraceRay → Miss or ClosestHit — no shading logic inline. SkyColor renamed to Miss. Section headers: [Utilities], [Intersection], [Miss Shader], [Closest Hit Shader], [Path Tracer], [Ray Generation]. NEE toggle: #define RITA_RAYGEN_NEE 0/1. Code style: Rt prefix on classes, Unreal-style PascalCase members, In prefix on parameters, braces on all control flow bodies.  
 > Next up: Milestone 9 — Two-level BVH (BLAS + TLAS). Per-mesh BVH built in local space (BLAS), top-level BVH over instances with 4×4 transforms (TLAS). Shader traversal becomes two-phase: test TLAS AABBs, transform ray into instance local space, traverse BLAS.
 
 ---
